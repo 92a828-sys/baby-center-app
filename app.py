@@ -116,10 +116,10 @@ def process_excel(file_bytes, year_roc, month, workdays):
     wb.save(out_sim)
     return out_sim.getvalue()
 
-# ================= 📄 Word 處理邏輯 =================
+# ================= 📄 Word 處理邏輯 (環境檢核表 & 消防表) =================
 
 def set_cell_shading(cell, color_hex):
-    """設定 Word 儲存格背景顏色"""
+    """設定 Word 儲存格背景顏色 (用於消防表塗灰)"""
     tcPr = cell._tc.get_or_add_tcPr()
     for shd in tcPr.findall(qn('w:shd')):
         tcPr.remove(shd)
@@ -130,6 +130,7 @@ def set_cell_shading(cell, color_hex):
     tcPr.append(new_shd)
 
 def safe_set_word_cell(cell, text, color="FFFFFF"):
+    """安全寫入 Word 儲存格並統一字型"""
     cell.text = ""
     set_cell_shading(cell, color)
     if not text: return
@@ -141,26 +142,30 @@ def safe_set_word_cell(cell, text, color="FFFFFF"):
     paragraph.alignment = 1
 
 def process_docx(file_bytes, year_roc, month, workdays, holidays, last_day):
+    """Word 核心處理邏輯：修正了 Row Text 錯誤並優化雙面表單支援"""
     doc = docx.Document(io.BytesIO(file_bytes))
     week_map = {0: '一', 1: '二', 2: '三', 3: '四', 4: '五'}
     
-    # 判斷是否為「消防檢查表」（通常含有 "消防" 或 "火源" 字樣）
+    # 讀取全文化來判斷類型
     doc_text = "".join([p.text for p in doc.paragraphs])
     is_fire_safety = "消防" in doc_text or "火源" in doc_text
 
-    # 1. 更新標題
+    # 1. 更新大標題 (115 年 03 月)
     for p in doc.paragraphs:
         pattern = r'\d{2,3}\s*年\s*\d{1,2}\s*月'
         if re.search(pattern, p.text):
-            p.text = re.sub(pattern, f"{year_roc} 年 {month:02d} 月", p.text)
-            for run in p.runs:
-                run.font.name = "Times New Roman"
-                run._element.rPr.rFonts.set(qn('w:eastAsia'), "標楷體")
+            original_text = p.text
+            new_text = re.sub(pattern, f"{year_roc} 年 {month:02d} 月", original_text)
+            p.text = "" 
+            run = p.add_run(new_text)
+            run.font.name = "Times New Roman"
+            run._element.rPr.rFonts.set(qn('w:eastAsia'), "標楷體")
+            run.font.size = Pt(12)
 
-    # 2. 表格處理
+    # 2. 遍歷表格處理內容
     for table in doc.tables:
         if is_fire_safety:
-            # --- 消防檢查表邏輯 (垂直或格狀分布) ---
+            # --- 消防檢查表邏輯：針對日期數字儲存格塗底色 ---
             for r_idx, row in enumerate(table.rows):
                 for c_idx, cell in enumerate(row.cells):
                     txt = cell.text.strip()
@@ -168,36 +173,46 @@ def process_docx(file_bytes, year_roc, month, workdays, holidays, last_day):
                         day = int(txt)
                         is_holiday = day in holidays or day > last_day
                         bg_color = "D9D9D9" if is_holiday else "FFFFFF"
-                        
-                        # 塗改日期格
                         set_cell_shading(cell, bg_color)
-                        # 如果是消防表常見的「日期下方的格子」，也一併塗灰
+                        # 塗改日期下方的檢查格 (如果有的話)
                         if r_idx + 1 < len(table.rows):
                             set_cell_shading(table.rows[r_idx+1].cells[c_idx], bg_color)
         else:
-            # --- 一般環境檢核表邏輯 (橫向日期排開) ---
+            # --- 環境衛生/教室檢核表邏輯：橫向填充工作日 ---
             date_row = None
+            weekday_row = None
+            
             for i, row in enumerate(table.rows):
-                if "日期" in row.text or "項目" in row.text:
+                # 修正處：正確讀取 Row 文字
+                combined_row_text = "".join([c.text for c in row.cells])
+                
+                if "日期" in combined_row_text or "項目" in combined_row_text:
                     date_row = row
-                    weekday_row = table.rows[i+1] if i+1 < len(table.rows) else None
+                    if i + 1 < len(table.rows):
+                        weekday_row = table.rows[i+1]
                     break
             
             if date_row:
+                # 偵測日期從哪一欄開始 (找出第一個數字格)
                 start_col = 0
                 for c_idx, cell in enumerate(date_row.cells):
                     if cell.text.strip().isdigit():
                         start_col = c_idx
                         break
+                
+                # 填入計算後的工作日日期與星期
                 for i in range(start_col, len(date_row.cells)):
                     idx = i - start_col
                     if idx < len(workdays):
                         d = workdays[idx]
                         safe_set_word_cell(date_row.cells[i], str(d.day))
-                        if weekday_row: safe_set_word_cell(weekday_row.cells[i], week_map[d.weekday()])
+                        if weekday_row: 
+                            safe_set_word_cell(weekday_row.cells[i], week_map[d.weekday()])
                     else:
+                        # 清空本月多餘的格子
                         safe_set_word_cell(date_row.cells[i], "")
-                        if weekday_row: safe_set_word_cell(weekday_row.cells[i], "")
+                        if weekday_row: 
+                            safe_set_word_cell(weekday_row.cells[i], "")
 
     out_sim = io.BytesIO()
     doc.save(out_sim)
@@ -235,3 +250,4 @@ if uploaded_files:
             file_name=f"廣慈報表_{target_year_roc}年{target_month}月.zip",
             mime="application/zip"
         )
+
