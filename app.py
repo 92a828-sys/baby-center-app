@@ -16,7 +16,7 @@ from datetime import date
 # ================= 🎨 介面設定 =================
 st.set_page_config(page_title="廣慈托嬰中心-行政自動化系統", page_icon="👶", layout="wide")
 st.title("📊 托育報表日期自動更新系統")
-st.markdown("支援範圍：監測表、冰箱表 (Excel) ｜ 環境檢核表、消防檢查表 (Word)")
+st.markdown("支援：監測表、冰箱表 (Excel) ｜ 環境檢核表、消防表、教室檢核表 (Word)")
 
 with st.sidebar:
     st.header("📅 全域設定")
@@ -24,10 +24,10 @@ with st.sidebar:
     target_month = st.number_input("設定目標月份", min_value=1, max_value=12, value=3)
     
     st.subheader("🛑 國定假日/停托日")
-    holiday_input = st.text_input("輸入日期 (例如: 3/28, 4/4)", help="用逗號隔開數字或月/日")
+    holiday_input = st.text_input("輸入日期 (例如: 3/28, 4/4)", help="用逗號隔開數字或月/日。若為雙月表，建議輸入 3/28, 4/4")
     
     st.divider()
-    st.info("💡 系統功能：\n1. 自動計算當月天數\n2. 自動跳過/塗灰假日\n3. 統一標楷體與英數 Times New Roman")
+    st.info("💡 雙面表單：系統會自動在第一區塊填目標月，第二區塊填次月。")
 
 # ================= 🛠️ 通用邏輯 =================
 
@@ -37,7 +37,6 @@ def get_target_info(year_roc, month, holiday_str):
     holidays_days = []
     
     if holiday_str:
-        # 兼容 "3/28" 或單純數字 "28" 的輸入
         for item in holiday_str.replace('，', ',').split(','):
             item = item.strip()
             if '/' in item:
@@ -116,10 +115,9 @@ def process_excel(file_bytes, year_roc, month, workdays):
     wb.save(out_sim)
     return out_sim.getvalue()
 
-# ================= 📄 Word 處理邏輯 (環境檢核表 & 消防表) =================
+# ================= 📄 Word 處理邏輯 =================
 
 def set_cell_shading(cell, color_hex):
-    """設定 Word 儲存格背景顏色 (用於消防表塗灰)"""
     tcPr = cell._tc.get_or_add_tcPr()
     for shd in tcPr.findall(qn('w:shd')):
         tcPr.remove(shd)
@@ -130,7 +128,6 @@ def set_cell_shading(cell, color_hex):
     tcPr.append(new_shd)
 
 def safe_set_word_cell(cell, text, color="FFFFFF"):
-    """安全寫入 Word 儲存格並統一字型"""
     cell.text = ""
     set_cell_shading(cell, color)
     if not text: return
@@ -141,21 +138,19 @@ def safe_set_word_cell(cell, text, color="FFFFFF"):
     run.font.size = Pt(12)
     paragraph.alignment = 1
 
-def process_docx(file_bytes, year_roc, month, workdays, holidays, last_day):
-    """Word 核心處理邏輯：修正了 Row Text 錯誤並優化雙面表單支援"""
+def process_docx(file_bytes, target_year_roc, target_month, holiday_input):
     doc = docx.Document(io.BytesIO(file_bytes))
     week_map = {0: '一', 1: '二', 2: '三', 3: '四', 4: '五'}
     
-    # 讀取全文化來判斷類型
     doc_text = "".join([p.text for p in doc.paragraphs])
     is_fire_safety = "消防" in doc_text or "火源" in doc_text
 
-    # 1. 更新大標題 (115 年 03 月)
+    # 1. 更新大標題
     for p in doc.paragraphs:
         pattern = r'\d{2,3}\s*年\s*\d{1,2}\s*月'
         if re.search(pattern, p.text):
             original_text = p.text
-            new_text = re.sub(pattern, f"{year_roc} 年 {month:02d} 月", original_text)
+            new_text = re.sub(pattern, f"{target_year_roc} 年 {target_month:02d} 月", original_text)
             p.text = "" 
             run = p.add_run(new_text)
             run.font.name = "Times New Roman"
@@ -165,7 +160,8 @@ def process_docx(file_bytes, year_roc, month, workdays, holidays, last_day):
     # 2. 遍歷表格處理內容
     for table in doc.tables:
         if is_fire_safety:
-            # --- 消防檢查表邏輯：針對日期數字儲存格塗底色 ---
+            # 消防檢查表邏輯 (單月)
+            _, holidays, last_day = get_target_info(target_year_roc, target_month, holiday_input)
             for r_idx, row in enumerate(table.rows):
                 for c_idx, cell in enumerate(row.cells):
                     txt = cell.text.strip()
@@ -174,42 +170,45 @@ def process_docx(file_bytes, year_roc, month, workdays, holidays, last_day):
                         is_holiday = day in holidays or day > last_day
                         bg_color = "D9D9D9" if is_holiday else "FFFFFF"
                         set_cell_shading(cell, bg_color)
-                        # 塗改日期下方的檢查格 (如果有的話)
                         if r_idx + 1 < len(table.rows):
                             set_cell_shading(table.rows[r_idx+1].cells[c_idx], bg_color)
         else:
-            # --- 環境衛生/教室檢核表邏輯：橫向填充工作日 ---
-            date_row = None
-            weekday_row = None
-            
+            # 環境/教室檢核表 (支援雙月份填充)
+            date_rows_found = []
             for i, row in enumerate(table.rows):
-                # 修正處：正確讀取 Row 文字
                 combined_row_text = "".join([c.text for c in row.cells])
-                
                 if "日期" in combined_row_text or "項目" in combined_row_text:
-                    date_row = row
-                    if i + 1 < len(table.rows):
-                        weekday_row = table.rows[i+1]
-                    break
+                    date_rows_found.append(i)
             
-            if date_row:
-                # 偵測日期從哪一欄開始 (找出第一個數字格)
+            # 針對找到的每一個日期區塊進行處理
+            for block_idx, row_idx in enumerate(date_rows_found):
+                calc_month = target_month + block_idx
+                calc_year = target_year_roc
+                if calc_month > 12:
+                    calc_month -= 12
+                    calc_year += 1
+                
+                # 重新計算該月份的工作日
+                block_workdays, _, _ = get_target_info(calc_year, calc_month, holiday_input)
+                
+                date_row = table.rows[row_idx]
+                weekday_row = table.rows[row_idx + 1] if row_idx + 1 < len(table.rows) else None
+                
                 start_col = 0
                 for c_idx, cell in enumerate(date_row.cells):
                     if cell.text.strip().isdigit():
                         start_col = c_idx
                         break
                 
-                # 填入計算後的工作日日期與星期
                 for i in range(start_col, len(date_row.cells)):
                     idx = i - start_col
-                    if idx < len(workdays):
-                        d = workdays[idx]
+                    if idx < len(block_workdays):
+                        d = block_workdays[idx]
                         safe_set_word_cell(date_row.cells[i], str(d.day))
                         if weekday_row: 
                             safe_set_word_cell(weekday_row.cells[i], week_map[d.weekday()])
                     else:
-                        # 清空本月多餘的格子
+                        # 清空多餘格子
                         safe_set_word_cell(date_row.cells[i], "")
                         if weekday_row: 
                             safe_set_word_cell(weekday_row.cells[i], "")
@@ -224,7 +223,8 @@ uploaded_files = st.file_uploader("📂 上傳報表 (Excel 或 Word)", type=["x
 
 if uploaded_files:
     if st.button("🚀 開始批次更新"):
-        workdays, holidays, last_day = get_target_info(target_year_roc, target_month, holiday_input)
+        # Excel 預設抓主月份
+        main_workdays, _, _ = get_target_info(target_year_roc, target_month, holiday_input)
         
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
@@ -233,9 +233,10 @@ if uploaded_files:
                 f_bytes = uploaded_file.read()
                 try:
                     if fname.endswith(".xlsx"):
-                        processed_data = process_excel(f_bytes, target_year_roc, target_month, workdays)
+                        processed_data = process_excel(f_bytes, target_year_roc, target_month, main_workdays)
                     elif fname.endswith(".docx"):
-                        processed_data = process_docx(f_bytes, target_year_roc, target_month, workdays, holidays, last_day)
+                        # Word 調用支援雙月的 process_docx
+                        processed_data = process_docx(f_bytes, target_year_roc, target_month, holiday_input)
                     
                     new_name = f"更新_{target_year_roc}年{target_month}月_{fname}"
                     zf.writestr(new_name, processed_data)
@@ -250,4 +251,3 @@ if uploaded_files:
             file_name=f"廣慈報表_{target_year_roc}年{target_month}月.zip",
             mime="application/zip"
         )
-
