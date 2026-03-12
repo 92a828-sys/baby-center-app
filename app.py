@@ -16,10 +16,14 @@ from datetime import date
 # ================= 🎨 介面設定 =================
 st.set_page_config(page_title="廣慈托嬰中心-行政自動化系統", page_icon="👶", layout="wide")
 st.title("📊 托育報表日期自動更新系統")
-st.markdown("支援：監測表、冰箱表 (Excel) ｜ 環境檢核表、消防表、教室檢核表 (Word)")
 
 with st.sidebar:
-    st.header("📅 全域設定")
+    st.header("🏢 單位設定")
+    # 新增單位選擇功能
+    dept_options = ["不指定", "IC1", "IC2", "NIDO", "廚房", "保健室", "行政"]
+    target_dept = st.selectbox("請選擇所屬班級/單位", options=dept_options)
+    
+    st.header("📅 全域日期設定")
     target_year_roc = st.number_input("設定目標民國年份", value=115)
     target_month = st.number_input("設定目標月份", min_value=1, max_value=12, value=3)
     
@@ -27,7 +31,7 @@ with st.sidebar:
     holiday_input = st.text_input("輸入日期 (例如: 3/28, 4/4)", help="用逗號隔開數字或月/日。若為雙月表，建議輸入 3/28, 4/4")
     
     st.divider()
-    st.info("💡 雙面表單：系統會自動在第一區塊填目標月，第二區塊填次月。")
+    st.info(f"💡 目前模式：{'通用' if target_dept == '不指定' else target_dept} 報表處理")
 
 # ================= 🛠️ 通用邏輯 =================
 
@@ -58,7 +62,7 @@ def get_target_info(year_roc, month, holiday_str):
 
 # ================= 📂 Excel 處理邏輯 =================
 
-def process_excel(file_bytes, year_roc, month, workdays):
+def process_excel(file_bytes, year_roc, month, workdays, dept):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
     week_map = {0: '一', 1: '二', 2: '三', 3: '四', 4: '五'}
     font_eng = Font(name='Times New Roman', size=12)
@@ -66,10 +70,15 @@ def process_excel(file_bytes, year_roc, month, workdays):
     align_center = Alignment(horizontal='center', vertical='center')
 
     for ws in wb.worksheets:
-        for row in ws.iter_rows(min_row=1, max_row=3, min_col=1, max_col=2):
+        # 更新標題日期與班級 (前三列)
+        for row in ws.iter_rows(min_row=1, max_row=3, min_col=1, max_col=10):
             for cell in row:
                 if cell.value and isinstance(cell.value, str):
+                    # 更新日期
                     cell.value = re.sub(r'\d{2,3}\s*[年./-]\s*\d{1,2}\s*月?', f"{year_roc}年{month:02d}月", cell.value)
+                    # 如果選擇了單位，試著自動填入班級名稱 (範本需有「班級：」字樣)
+                    if dept != "不指定" and "班級" in cell.value and "：" in cell.value:
+                        cell.value = f"班級：{dept}"
 
         ws_content = "".join([str(cell.value) for row in ws.iter_rows(max_row=10, max_col=5) for cell in row if cell.value])
         
@@ -138,29 +147,32 @@ def safe_set_word_cell(cell, text, color="FFFFFF"):
     run.font.size = Pt(12)
     paragraph.alignment = 1
 
-def process_docx(file_bytes, target_year_roc, target_month, holiday_input):
+def process_docx(file_bytes, target_year_roc, target_month, holiday_input, dept):
     doc = docx.Document(io.BytesIO(file_bytes))
     week_map = {0: '一', 1: '二', 2: '三', 3: '四', 4: '五'}
     
     doc_text = "".join([p.text for p in doc.paragraphs])
     is_fire_safety = "消防" in doc_text or "火源" in doc_text
 
-    # 1. 更新大標題
+    # 1. 更新大標題與班級
     for p in doc.paragraphs:
-        pattern = r'\d{2,3}\s*年\s*\d{1,2}\s*月'
-        if re.search(pattern, p.text):
-            original_text = p.text
-            new_text = re.sub(pattern, f"{target_year_roc} 年 {target_month:02d} 月", original_text)
-            p.text = "" 
-            run = p.add_run(new_text)
-            run.font.name = "Times New Roman"
-            run._element.rPr.rFonts.set(qn('w:eastAsia'), "標楷體")
-            run.font.size = Pt(12)
+        # 更新日期
+        if re.search(r'\d{2,3}\s*年\s*\d{1,2}\s*月', p.text):
+            p.text = re.sub(r'\d{2,3}\s*年\s*\d{1,2}\s*月', f"{target_year_roc} 年 {target_month:02d} 月", p.text)
+            for run in p.runs:
+                run.font.name = "Times New Roman"
+                run._element.rPr.rFonts.set(qn('w:eastAsia'), "標楷體")
+        
+        # 如果有單位資訊，自動更新 (例如：班級：________)
+        if dept != "不指定" and "班級：" in p.text:
+            p.text = f"班級：{dept}"
+            for run in p.runs:
+                run.font.name = "Times New Roman"
+                run._element.rPr.rFonts.set(qn('w:eastAsia'), "標楷體")
 
-    # 2. 遍歷表格處理內容
+    # 2. 表格處理
     for table in doc.tables:
         if is_fire_safety:
-            # 消防檢查表邏輯 (單月)
             _, holidays, last_day = get_target_info(target_year_roc, target_month, holiday_input)
             for r_idx, row in enumerate(table.rows):
                 for c_idx, cell in enumerate(row.cells):
@@ -173,14 +185,12 @@ def process_docx(file_bytes, target_year_roc, target_month, holiday_input):
                         if r_idx + 1 < len(table.rows):
                             set_cell_shading(table.rows[r_idx+1].cells[c_idx], bg_color)
         else:
-            # 環境/教室檢核表 (支援雙月份填充)
             date_rows_found = []
             for i, row in enumerate(table.rows):
                 combined_row_text = "".join([c.text for c in row.cells])
                 if "日期" in combined_row_text or "項目" in combined_row_text:
                     date_rows_found.append(i)
             
-            # 針對找到的每一個日期區塊進行處理
             for block_idx, row_idx in enumerate(date_rows_found):
                 calc_month = target_month + block_idx
                 calc_year = target_year_roc
@@ -188,9 +198,7 @@ def process_docx(file_bytes, target_year_roc, target_month, holiday_input):
                     calc_month -= 12
                     calc_year += 1
                 
-                # 重新計算該月份的工作日
                 block_workdays, _, _ = get_target_info(calc_year, calc_month, holiday_input)
-                
                 date_row = table.rows[row_idx]
                 weekday_row = table.rows[row_idx + 1] if row_idx + 1 < len(table.rows) else None
                 
@@ -208,7 +216,6 @@ def process_docx(file_bytes, target_year_roc, target_month, holiday_input):
                         if weekday_row: 
                             safe_set_word_cell(weekday_row.cells[i], week_map[d.weekday()])
                     else:
-                        # 清空多餘格子
                         safe_set_word_cell(date_row.cells[i], "")
                         if weekday_row: 
                             safe_set_word_cell(weekday_row.cells[i], "")
@@ -223,7 +230,6 @@ uploaded_files = st.file_uploader("📂 上傳報表 (Excel 或 Word)", type=["x
 
 if uploaded_files:
     if st.button("🚀 開始批次更新"):
-        # Excel 預設抓主月份
         main_workdays, _, _ = get_target_info(target_year_roc, target_month, holiday_input)
         
         zip_buffer = io.BytesIO()
@@ -233,21 +239,23 @@ if uploaded_files:
                 f_bytes = uploaded_file.read()
                 try:
                     if fname.endswith(".xlsx"):
-                        processed_data = process_excel(f_bytes, target_year_roc, target_month, main_workdays)
+                        processed_data = process_excel(f_bytes, target_year_roc, target_month, main_workdays, target_dept)
                     elif fname.endswith(".docx"):
-                        # Word 調用支援雙月的 process_docx
-                        processed_data = process_docx(f_bytes, target_year_roc, target_month, holiday_input)
+                        processed_data = process_docx(f_bytes, target_year_roc, target_month, holiday_input, target_dept)
                     
-                    new_name = f"更新_{target_year_roc}年{target_month}月_{fname}"
+                    # 檔名前綴處理
+                    prefix = f"{target_dept}_" if target_dept != "不指定" else ""
+                    new_name = f"{prefix}更新_{target_year_roc}年{target_month}月_{fname}"
+                    
                     zf.writestr(new_name, processed_data)
-                    st.write(f"✅ 已完成: {fname}")
+                    st.write(f"✅ 已完成: {new_name}")
                 except Exception as e:
                     st.error(f"❌ 處理 {fname} 出錯: {e}")
         
         st.success(f"🎉 全部處理完成！")
         st.download_button(
-            label="📥 下載更新後的報表 (ZIP)",
+            label=f"📥 下載 {target_dept} 更新報表 (ZIP)",
             data=zip_buffer.getvalue(),
-            file_name=f"廣慈報表_{target_year_roc}年{target_month}月.zip",
+            file_name=f"{target_dept}_報表_{target_year_roc}年{target_month}月.zip",
             mime="application/zip"
         )
