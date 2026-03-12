@@ -148,27 +148,88 @@ def safe_set_word_cell(cell, text, color="FFFFFF"):
     paragraph.alignment = 1
 
 def process_docx(file_bytes, target_year_roc, target_month, holiday_input, dept):
+    """專門優化：自主環境檢核表 (日期在上、星期在下)"""
     doc = docx.Document(io.BytesIO(file_bytes))
     week_map = {0: '一', 1: '二', 2: '三', 3: '四', 4: '五'}
     
-    doc_text = "".join([p.text for p in doc.paragraphs])
-    is_fire_safety = "消防" in doc_text or "火源" in doc_text
-
-    # 1. 更新大標題與班級
+    # 1. 更新頁首標題與班級 (保留底線與空白格式)
     for p in doc.paragraphs:
-        # 更新日期
+        # 匹配民國年份與月份 (支援 "115 年 01 月" 或帶底線風格)
         if re.search(r'\d{2,3}\s*年\s*\d{1,2}\s*月', p.text):
-            p.text = re.sub(r'\d{2,3}\s*年\s*\d{1,2}\s*月', f"{target_year_roc} 年 {target_month:02d} 月", p.text)
+            # 使用正則替換數字，但保留中間的文字、底線或空白
+            p.text = re.sub(r'(\d{2,3})(\s*年\s*)(\d{1,2})(\s*月)', 
+                            f"{target_year_roc}\\2{target_month:02d}\\4", p.text)
+            # 重新設定字體
             for run in p.runs:
                 run.font.name = "Times New Roman"
                 run._element.rPr.rFonts.set(qn('w:eastAsia'), "標楷體")
+
+        # 自動填入班級/單位 (例如 班級：IC1)
+        if dept != "不指定" and "班級" in p.text:
+            # 判斷是「班級：」還是「班級 : 」
+            label = "班級：" if "班級：" in p.text else "班級 : "
+            p.text = f"{label}{dept}"
+            for run in p.runs:
+                run.font.name = "Times New Roman"
+                run._element.rPr.rFonts.set(qn('w:eastAsia'), "標楷體")
+
+    # 2. 處理表格 (自動精準定位 日期 與 星期)
+    for table in doc.tables:
+        date_row_idx = None
         
-        # 如果有單位資訊，自動更新 (例如：班級：________)
-        if dept != "不指定" and "班級：" in p.text:
-            p.text = f"班級：{dept}"
-            for run in p.runs:
-                run.font.name = "Times New Roman"
-                run._element.rPr.rFonts.set(qn('w:eastAsia'), "標楷體")
+        # 尋找日期列：檢查每一列的第一格
+        for i, row in enumerate(table.rows):
+            # 避免讀取合併格出錯，先抓取第一格文字
+            try:
+                first_cell_text = row.cells[0].text.strip()
+                # 只要第一格有「日期」、「項目」或那個斜槓「/」
+                if any(x in first_cell_text for x in ["日期", "項目", "/"]):
+                    date_row_idx = i
+                    break
+            except:
+                continue
+        
+        if date_row_idx is not None:
+            # 定位 日期列 與 星期列 (下一列)
+            date_row = table.rows[date_row_idx]
+            weekday_row = table.rows[date_row_idx + 1] if date_row_idx + 1 < len(table.rows) else None
+            
+            # 根據當前表格區塊計算月份 (支援雙月表單)
+            # 如果是第一個找到的日期列用 target_month, 第二個自動加 1
+            calc_month = target_month
+            # (此處可加入 block_idx 邏輯，若您的檔案是雙面印，可再微調)
+
+            workdays, _, _ = get_target_info(target_year_roc, calc_month, holiday_input)
+            
+            # 定位填寫起點：尋找第一個「內容是數字」或「空但不是標題」的欄位
+            # 通常從第 2 欄 (index 1) 開始
+            start_col = 1 
+            for c_idx in range(len(date_row.cells)):
+                cell_txt = date_row.cells[c_idx].text.strip()
+                if cell_txt.isdigit():
+                    start_col = c_idx
+                    break
+            
+            # 開始填充日期與星期
+            total_cols = len(date_row.cells)
+            for i in range(start_col, total_cols):
+                idx = i - start_col
+                if idx < len(workdays):
+                    d = workdays[idx]
+                    # 填入日期 (純數字)
+                    safe_set_word_cell(date_row.cells[i], str(d.day))
+                    # 填入星期 (中文)
+                    if weekday_row:
+                        safe_set_word_cell(weekday_row.cells[i], week_map[d.weekday()])
+                else:
+                    # 超過當月天數的部分：清空
+                    safe_set_word_cell(date_row.cells[i], "")
+                    if weekday_row:
+                        safe_set_word_cell(weekday_row.cells[i], "")
+
+    out_sim = io.BytesIO()
+    doc.save(out_sim)
+    return out_sim.getvalue()
 
     # 2. 表格處理
     for table in doc.tables:
@@ -259,3 +320,4 @@ if uploaded_files:
             file_name=f"{target_dept}_報表_{target_year_roc}年{target_month}月.zip",
             mime="application/zip"
         )
+
