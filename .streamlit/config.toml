@@ -1,0 +1,8 @@
+[theme]
+primaryColor = "#4A90E2"       # 專業藍色
+backgroundColor = "#FDFDFD"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#262730"
+
+[layout]
+gatherUsageStats = false        # 關閉統計資訊
