@@ -1,273 +1,209 @@
 import streamlit as st
-
-import io
-
+import openpyxl
+from openpyxl.styles import Font, Alignment
+from openpyxl.cell.cell import MergedCell
+import docx
+from docx.shared import Pt
+from docx.oxml.ns import qn
+import os
+import calendar
 import re
-
+import io
+import zipfile
 from datetime import date
 
-from dateutil.relativedelta import relativedelta
+# ================= 🎨 介面設定 =================
+st.set_page_config(page_title="廣慈托嬰中心-行政自動化系統", page_icon="👶", layout="wide")
+st.title("📊 托育報表日期自動更新系統")
+st.markdown("支援範圍：幼生監測表、冰箱記錄表 (Excel) 及 環境自主檢核表 (Word)")
 
-from docx import Document
+with st.sidebar:
+    st.header("📅 全域設定")
+    target_year_roc = st.number_input("設定目標民國年份", value=115)
+    target_month = st.number_input("設定目標月份", min_value=1, max_value=12, value=3)
+    
+    st.subheader("🛑 國定假日/停托日")
+    holiday_input = st.text_input("輸入日期 (例如: 3/28, 4/4)", help="用逗號隔開，程式會自動跳過這些日子")
+    
+    st.divider()
+    st.info("💡 系統會自動識別：\n1. .xlsx -> 監測表/冰箱表\n2. .docx -> 環境檢核表")
 
-from docx.oxml.ns import qn
+# ================= 🛠️ 通用邏輯 =================
 
-from docx.shared import Pt
+def get_workdays_list(year_roc, month, holiday_str):
+    """取得該月工作日列表 (date 物件)"""
+    year_ad = year_roc + 1911
+    _, last_day = calendar.monthrange(year_ad, month)
+    holidays = []
+    if holiday_str:
+        for item in holiday_str.replace('，', ',').split(','):
+            try:
+                m, d = item.strip().split('/')
+                holidays.append((int(m), int(d)))
+            except: continue
+    
+    workdays = []
+    for d in range(1, last_day + 1):
+        curr = date(year_ad, month, d)
+        if curr.weekday() < 5 and (month, d) not in holidays:
+            workdays.append(curr)
+    return workdays
 
-import zipfile
+# ================= 📂 Excel 處理邏輯 (監測表/冰箱表) =================
 
+def process_excel(file_bytes, year_roc, month, workdays):
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    week_map = {0: '一', 1: '二', 2: '三', 3: '四', 4: '五'}
+    font_eng = Font(name='Times New Roman', size=12)
+    font_chi = Font(name='標楷體', size=12)
+    align_center = Alignment(horizontal='center', vertical='center')
 
+    for ws in wb.worksheets:
+        # 1. 標題替換
+        for row in ws.iter_rows(min_row=1, max_row=3, min_col=1, max_col=2):
+            for cell in row:
+                if cell.value and isinstance(cell.value, str):
+                    cell.value = re.sub(r'\d{2,3}\s*[年./-]\s*\d{1,2}\s*月?', f"{year_roc}年{month:02d}月", cell.value)
 
-# ================= 📅 設定區 =================
+        # 2. 內容填充
+        ws_content = "".join([str(cell.value) for row in ws.iter_rows(max_row=10, max_col=5) for cell in row if cell.value])
+        
+        if "冰箱" in ws_content:
+            curr_row = 6
+            for d in workdays:
+                ws.cell(row=curr_row, column=1).value = f"{d.month}/{d.day}"
+                ws.cell(row=curr_row, column=2).value = week_map[d.weekday()]
+                ws.cell(row=curr_row+1, column=1).value = None
+                ws.cell(row=curr_row+1, column=2).value = None
+                curr_row += 2
+            while curr_row <= 70:
+                if not isinstance(ws.cell(row=curr_row, column=1), MergedCell):
+                    ws.cell(row=curr_row, column=1).value = None
+                    ws.cell(row=curr_row, column=2).value = None
+                curr_row += 1
 
-DATES_TO_FILL = [
+        elif "監測" in ws_content or "星期" in ws_content:
+            date_row = 3
+            start_col = 4
+            for r in range(1, 6):
+                row_vals = [str(ws.cell(row=r, column=c).value) for c in range(1, 6)]
+                if any("星期" in v for v in row_vals) or any("日期" in v for v in row_vals):
+                    date_row = r
+                    break
+            for i, d in enumerate(workdays):
+                col = start_col + i
+                c_day = ws.cell(row=date_row, column=col)
+                if not isinstance(c_day, MergedCell):
+                    c_day.value = d.day
+                    c_day.font = font_eng
+                    c_day.alignment = align_center
+                c_week = ws.cell(row=date_row+1, column=col)
+                if not isinstance(c_week, MergedCell):
+                    c_week.value = week_map[d.weekday()]
+                    c_week.font = font_chi
+                    c_week.alignment = align_center
+            for col in range(start_col + len(workdays), 40):
+                c_check = ws.cell(row=date_row, column=col)
+                if c_check.value and ("餵藥" in str(c_check.value) or "統計" in str(c_check.value)): break
+                if not isinstance(c_check, MergedCell): c_check.value = None
+                c_next = ws.cell(row=date_row+1, column=col)
+                if not isinstance(c_next, MergedCell): c_next.value = None
 
-    ("115.02.24", 2026, 2, 24),
+    out_sim = io.BytesIO()
+    wb.save(out_sim)
+    return out_sim.getvalue()
 
-    ("115.03.25", 2026, 3, 25),
+# ================= 📄 Word 處理邏輯 (環境檢核表) =================
 
-    ("115.04.22", 2026, 4, 22),
-
-    ("115.05.21", 2026, 5, 21),
-
-    ("115.06.24", 2026, 6, 24),
-
-]
-
-
-
-# ================= 核心功能函式 =================
-
-
-
-def set_cell_style_dual_font(cell, text):
-
+def safe_set_word_cell(cell, text):
     cell.text = ""
-
+    if not text: return
     paragraph = cell.paragraphs[0]
-
-    run = paragraph.add_run(text)
-
+    run = paragraph.add_run(str(text))
     run.font.name = "Times New Roman"
-
     run._element.rPr.rFonts.set(qn('w:eastAsia'), "標楷體")
-
     run.font.size = Pt(12)
+    paragraph.alignment = 1
 
+def process_docx(file_bytes, year_roc, month, workdays):
+    doc = docx.Document(io.BytesIO(file_bytes))
+    week_map = {0: '一', 1: '二', 2: '三', 3: '四', 4: '五'}
+    
+    # 1. 更新大標題
+    for p in doc.paragraphs:
+        pattern = r'11[0-9]\s*年\s*(?:1[0-2]|0?[1-9])?\s*月'
+        if re.search(pattern, p.text):
+            new_text = re.sub(pattern, f"{year_roc} 年 {month:02d} 月", p.text)
+            p.text = ""
+            run = p.add_run(new_text)
+            run.font.name = "Times New Roman"
+            run._element.rPr.rFonts.set(qn('w:eastAsia'), "標楷體")
+            run.font.size = Pt(12)
 
-
-def find_birthday_in_doc(doc):
-
-    pattern = r"生日.*?(\d{2,3})[./年](\d{1,2})[./月](\d{1,2})"
-
-    # 搜尋段落與表格 (含巢狀)
-
-    for para in doc.paragraphs:
-
-        match = re.search(pattern, para.text)
-
-        if match:
-
-            y, m, d = match.groups()
-
-            return date(int(y) + 1911, int(m), int(d))
-
+    # 2. 更新表格
     for table in doc.tables:
+        date_row = None
+        weekday_row = None
+        start_col = 2
+        for i, row in enumerate(table.rows):
+            row_text = "".join([c.text.strip() for c in row.cells])
+            if "日期" in row_text or "項目" in row_text:
+                date_row = row
+                if i + 1 < len(table.rows): weekday_row = table.rows[i + 1]
+                for c_idx, cell in enumerate(date_row.cells):
+                    if cell.text.strip().isdigit():
+                        start_col = c_idx
+                        break
+                break
+        
+        if date_row and weekday_row:
+            for i in range(start_col, len(date_row.cells)):
+                idx = i - start_col
+                if idx < len(workdays):
+                    d = workdays[idx]
+                    safe_set_word_cell(date_row.cells[i], str(d.day))
+                    safe_set_word_cell(weekday_row.cells[i], week_map[d.weekday()])
+                else:
+                    safe_set_word_cell(date_row.cells[i], "")
+                    safe_set_word_cell(weekday_row.cells[i], "")
 
-        for row in table.rows:
+    out_sim = io.BytesIO()
+    doc.save(out_sim)
+    return out_sim.getvalue()
 
-            for cell in row.cells:
+# ================= 🚀 執行介面 =================
 
-                match = re.search(pattern, cell.text)
-
-                if match:
-
-                    y, m, d = match.groups()
-
-                    return date(int(y) + 1911, int(m), int(d))
-
-    return None
-
-
-
-def calculate_age(birth_date_obj, target_date_obj):
-
-    diff = relativedelta(target_date_obj, birth_date_obj)
-
-    return f"{diff.years}Y{diff.months:02d}m{diff.days:02d}d"
-
-
-
-def find_measurement_table(doc):
-
-    all_tables = []
-
-    for tbl in doc.tables:
-
-        all_tables.append(tbl)
-
-        for row in tbl.rows:
-
-            for cell in row.cells:
-
-                if cell.tables:
-
-                    all_tables.extend(cell.tables)
-
-    for tbl in all_tables:
-
-        if len(tbl.rows) > 0:
-
-            header_text = "".join([c.text for c in tbl.rows[0].cells]).replace(" ", "").replace("\n", "")
-
-            if ("量測日期" in header_text) or ("身高" in header_text and "體重" in header_text):
-
-                return tbl
-
-    return None
-
-
-
-def get_fillable_row(table, start_index):
-
-    for i in range(start_index, len(table.rows)):
-
-        row = table.rows[i]
-
-        if row.cells:
-
-            cell_text = row.cells[0].text.strip().lower()
-
-            if "ymd" in cell_text or cell_text == "":
-
-                return row, i
-
-    return None, -1
-
-
-
-# ================= Streamlit 介面 =================
-
-
-
-st.set_page_config(page_title="自動填寫體位測量表", page_icon="📝")
-
-st.title("📝 幼兒體位測量表自動填寫")
-
-st.info("請上傳 Word 檔案 (.docx)，系統將自動偵測生日並填入 115 學年度測量日期與年齡。")
-
-
-
-uploaded_files = st.file_uploader("選擇 Word 檔案", type="docx", accept_multiple_files=True)
-
-
+uploaded_files = st.file_uploader("📂 上傳報表 (Excel 或 Word)", type=["xlsx", "docx"], accept_multiple_files=True)
 
 if uploaded_files:
-
-    if st.button("開始處理檔案"):
-
-        processed_files = []
-
-        progress_bar = st.progress(0)
-
+    if st.button("🚀 開始批次更新"):
+        workdays = get_workdays_list(target_year_roc, target_month, holiday_input)
         
-
-        for idx, uploaded_file in enumerate(uploaded_files):
-
-            # 讀取檔案
-
-            doc = Document(uploaded_file)
-
-            birth_date = find_birthday_in_doc(doc)
-
-            
-
-            if birth_date:
-
-                table = find_measurement_table(doc)
-
-                if table:
-
-                    current_search_idx = 1
-
-                    for date_str, y, m, d in DATES_TO_FILL:
-
-                        target_date = date(y, m, d)
-
-                        age_str = calculate_age(birth_date, target_date)
-
-                        target_row, found_idx = get_fillable_row(table, current_search_idx)
-
-                        
-
-                        if target_row:
-
-                            current_search_idx = found_idx + 1
-
-                        else:
-
-                            target_row = table.add_row()
-
-                            current_search_idx = len(table.rows)
-
-                        
-
-                        if len(target_row.cells) >= 2:
-
-                            set_cell_style_dual_font(target_row.cells[0], date_str)
-
-                            set_cell_style_dual_font(target_row.cells[1], age_str)
-
-                    
-
-                    # 儲存到 BytesIO
-
-                    output_stream = io.BytesIO()
-
-                    doc.save(output_stream)
-
-                    processed_files.append((uploaded_file.name, output_stream.getvalue()))
-
-                else:
-
-                    st.warning(f"⚠️ {uploaded_file.name}: 找不到對應表格。")
-
-            else:
-
-                st.warning(f"⚠️ {uploaded_file.name}: 找不到生日資訊。")
-
-            
-
-            progress_bar.progress((idx + 1) / len(uploaded_files))
-
-
-
-        if processed_files:
-
-            st.success(f"✅ 成功處理 {len(processed_files)} 個檔案！")
-
-            
-
-            # 建立 ZIP 下載
-
+        if not workdays:
+            st.error("❌ 找不到工作日，請檢查月份設定。")
+        else:
             zip_buffer = io.BytesIO()
-
             with zipfile.ZipFile(zip_buffer, "w") as zf:
-
-                for name, content in processed_files:
-
-                    zf.writestr(name, content)
-
+                for uploaded_file in uploaded_files:
+                    fname = uploaded_file.name
+                    f_bytes = uploaded_file.read()
+                    
+                    try:
+                        if fname.endswith(".xlsx"):
+                            processed_data = process_excel(f_bytes, target_year_roc, target_month, workdays)
+                        elif fname.endswith(".docx"):
+                            processed_data = process_docx(f_bytes, target_year_roc, target_month, workdays)
+                        
+                        new_name = f"更新_{target_year_roc}年{target_month}月_{fname}"
+                        zf.writestr(new_name, processed_data)
+                        st.write(f"✅ 已處理: {fname}")
+                    except Exception as e:
+                        st.error(f"❌ 處理 {fname} 時出錯: {e}")
             
-
+            st.success(f"🎉 全部處理完成！共 {len(uploaded_files)} 個檔案。")
             st.download_button(
-
-                label="📥 下載所有處理後的檔案 (ZIP)",
-
+                label="📥 下載更新後的報表 (ZIP)",
                 data=zip_buffer.getvalue(),
-
-                file_name="processed_documents.zip",
-
+                file_name=f"廣慈報表整合包_{target_year_roc}年{target_month}月.zip",
                 mime="application/zip"
-
             )
